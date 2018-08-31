@@ -30,7 +30,11 @@ class ExtensionConnection extends Connection {
   _onEvent(source, method, params) {
     // log events received
     log.log('<=', method, params);
-    this.emitNotification(method, params);
+
+    // Warning: type cast, assuming that debugger API is giving us a valid protocol event.
+    // Must be cast together since types of `params` and `method` come as a pair.
+    const eventMessage = /** @type {LH.Protocol.RawEventMessage} */({method, params});
+    this.emitProtocolEvent(eventMessage);
   }
 
   /**
@@ -104,42 +108,6 @@ class ExtensionConnection extends Connection {
   }
 
   /**
-   * Call protocol methods.
-   * @override
-   * @param {string} method
-   * @param {object=} params
-   * @return {Promise<*>}
-   */
-  sendCommand(method, params) {
-    return new Promise((resolve, reject) => {
-      log.formatProtocol('method => browser', {method, params}, 'verbose');
-      if (!this._tabId) {
-        log.error('ExtensionConnection', 'No tabId set for sendCommand');
-        return reject(new Error('No tabId set for sendCommand'));
-      }
-
-      chrome.debugger.sendCommand({tabId: this._tabId}, method, params, result => {
-        if (chrome.runtime.lastError) {
-          // The error from the extension has a `message` property that is the
-          // stringified version of the actual protocol error object.
-          const message = chrome.runtime.lastError.message || '';
-          let errorMessage;
-          try {
-            errorMessage = JSON.parse(message).message;
-          } catch (e) {}
-          errorMessage = errorMessage || message || 'Unknown debugger protocol error.';
-
-          log.formatProtocol('method <= browser ERR', {method}, 'error');
-          return reject(new Error(`Protocol error (${method}): ${errorMessage}`));
-        }
-
-        log.formatProtocol('method <= browser OK', {method, params: result}, 'verbose');
-        resolve(result);
-      });
-    });
-  }
-
-  /**
    * @return {Promise<chrome.tabs.Tab>}
    * @private
    */
@@ -154,14 +122,23 @@ class ExtensionConnection extends Connection {
         if (chrome.runtime.lastError) {
           return reject(chrome.runtime.lastError);
         }
+
+        const errMessage = 'Couldn\'t resolve current tab. Check your URL, reload, and try again.';
         if (tabs.length === 0) {
-          const message = 'Couldn\'t resolve current tab. Check your URL, reload, and try again.';
-          return reject(new Error(message));
+          return reject(new Error(errMessage));
         }
         if (tabs.length > 1) {
           log.warn('ExtensionConnection', '_queryCurrentTab returned multiple tabs');
         }
-        resolve(tabs[0]);
+
+        const firstUrledTab = tabs.find(tab => !!tab.url);
+        if (!firstUrledTab) {
+          const tabIds = tabs.map(tab => tab.id).join(', ');
+          const message = errMessage + ` Found ${tabs.length} tab(s) with id(s) [${tabIds}].`;
+          return reject(new Error(message));
+        }
+
+        resolve(firstUrledTab);
       }));
     });
   }
@@ -194,5 +171,54 @@ class ExtensionConnection extends Connection {
     });
   }
 }
+
+/**
+ * @typedef {LH.CrdpCommands[keyof LH.CrdpCommands]} CommandInfo
+ */
+// Declared outside class body because function expressions can be typed via coercive @type
+/**
+ * Looser-typed internal implementation of `ExtensionConnection.sendCommand`
+ * which is strictly typed externally on exposed ExtensionConnection interface.
+ * See `Driver.sendCommand` for explanation.
+ * @this {ExtensionConnection}
+ * @param {keyof LH.CrdpCommands} method
+ * @param {CommandInfo['paramsType']=} params,
+ * @return {Promise<CommandInfo['returnType']>}
+ */
+function _sendCommand(method, params) {
+  return new Promise((resolve, reject) => {
+    log.formatProtocol('method => browser', {method, params}, 'verbose');
+    if (!this._tabId) { // eslint-disable-line no-invalid-this
+      log.error('ExtensionConnection', 'No tabId set for sendCommand');
+      return reject(new Error('No tabId set for sendCommand'));
+    }
+
+    // eslint-disable-next-line no-invalid-this
+    chrome.debugger.sendCommand({tabId: this._tabId}, method, params || {}, result => {
+      if (chrome.runtime.lastError) {
+        // The error from the extension has a `message` property that is the
+        // stringified version of the actual protocol error object.
+        const message = chrome.runtime.lastError.message || '';
+        let errorMessage;
+        try {
+          errorMessage = JSON.parse(message).message;
+        } catch (e) {}
+        errorMessage = errorMessage || message || 'Unknown debugger protocol error.';
+
+        log.formatProtocol('method <= browser ERR', {method}, 'error');
+        return reject(new Error(`Protocol error (${method}): ${errorMessage}`));
+      }
+
+      log.formatProtocol('method <= browser OK', {method, params: result}, 'verbose');
+      resolve(result);
+    });
+  });
+}
+
+/**
+ * Call protocol methods.
+ * @type {LH.Protocol.SendCommand}
+ */
+ExtensionConnection.prototype.sendCommand = _sendCommand;
 
 module.exports = ExtensionConnection;

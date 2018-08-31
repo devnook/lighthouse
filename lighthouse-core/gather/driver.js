@@ -9,9 +9,11 @@ const NetworkRecorder = require('../lib/network-recorder');
 const emulation = require('../lib/emulation');
 const Element = require('../lib/element');
 const LHError = require('../lib/errors');
+const NetworkRequest = require('../lib/network-request');
 const EventEmitter = require('events').EventEmitter;
 const URL = require('../lib/url-shim');
 const TraceParser = require('../lib/traces/trace-parser');
+const constants = require('../config/constants');
 
 const log = require('lighthouse-logger');
 const DevtoolsLog = require('./devtools-log');
@@ -29,16 +31,20 @@ const DEFAULT_NETWORK_QUIET_THRESHOLD = 5000;
 // Controls how long to wait between longtasks before determining the CPU is idle, off by default
 const DEFAULT_CPU_QUIET_THRESHOLD = 0;
 
-class Driver {
-  static get MAX_WAIT_FOR_FULLY_LOADED() {
-    return 45 * 1000;
-  }
+/**
+ * @typedef {LH.StrictEventEmitter<LH.CrdpEvents>} CrdpEventEmitter
+ */
 
+class Driver {
   /**
    * @param {Connection} connection
    */
   constructor(connection) {
     this._traceCategories = Driver.traceCategories;
+    /**
+     * An event emitter that enforces mapping between Crdp event names and payload types.
+     * @type {CrdpEventEmitter}
+     */
     this._eventEmitter = new EventEmitter();
     this._connection = connection;
     // currently only used by WPT where just Page and Network are needed
@@ -63,10 +69,10 @@ class Driver {
      */
     this._monitoredUrl = null;
 
-    connection.on('notification', event => {
+    connection.on('protocolevent', event => {
       this._devtoolsLog.record(event);
       if (this._networkStatusMonitor) {
-        this._networkStatusMonitor.dispatch(event.method, event.params);
+        this._networkStatusMonitor.dispatch(event);
       }
       this._eventEmitter.emit(event.method, event.params);
     });
@@ -102,6 +108,14 @@ class Driver {
   }
 
   /**
+   * Computes the ULTRADUMB™ benchmark index to get a rough estimate of device class.
+   * @return {Promise<number>}
+   */
+  getBenchmarkIndex() {
+    return this.evaluateAsync(`(${pageFunctions.ultradumbBenchmark.toString()})()`);
+  }
+
+  /**
    * @return {Promise<void>}
    */
   connect() {
@@ -122,49 +136,6 @@ class Driver {
    */
   wsEndpoint() {
     return this._connection.wsEndpoint();
-  }
-
-  /**
-   * Bind listeners for protocol events
-   * @param {string} eventName
-   * @param {(event: any) => void} cb
-   */
-  on(eventName, cb) {
-    if (this._eventEmitter === null) {
-      throw new Error('connect() must be called before attempting to listen to events.');
-    }
-
-    // log event listeners being bound
-    log.formatProtocol('listen for event =>', {method: eventName}, 'verbose');
-    this._eventEmitter.on(eventName, cb);
-  }
-
-  /**
-   * Bind a one-time listener for protocol events. Listener is removed once it
-   * has been called.
-   * @param {string} eventName
-   * @param {(event: any) => void} cb
-   */
-  once(eventName, cb) {
-    if (this._eventEmitter === null) {
-      throw new Error('connect() must be called before attempting to listen to events.');
-    }
-    // log event listeners being bound
-    log.formatProtocol('listen once for event =>', {method: eventName}, 'verbose');
-    this._eventEmitter.once(eventName, cb);
-  }
-
-  /**
-   * Unbind event listeners
-   * @param {string} eventName
-   * @param {(event: any) => void} cb
-   */
-  off(eventName, cb) {
-    if (this._eventEmitter === null) {
-      throw new Error('connect() must be called before attempting to remove an event listener.');
-    }
-
-    this._eventEmitter.removeListener(eventName, cb);
   }
 
   /**
@@ -197,25 +168,6 @@ class Driver {
   }
 
   /**
-   * Call protocol methods
-   * @param {string} method
-   * @param {object=} params
-   * @param {{silent: boolean}=} cmdOpts
-   * @return {Promise<any>}
-   */
-  sendCommand(method, params, cmdOpts) {
-    const domainCommand = /^(\w+)\.(enable|disable)$/.exec(method);
-    if (domainCommand) {
-      const enable = domainCommand[2] === 'enable';
-      if (!this._shouldToggleDomain(domainCommand[1], enable)) {
-        return Promise.resolve();
-      }
-    }
-
-    return this._connection.sendCommand(method, params, cmdOpts);
-  }
-
-  /**
    * Returns whether a domain is currently enabled.
    * @param {string} domain
    * @return {boolean}
@@ -230,7 +182,7 @@ class Driver {
    * @param {string} scriptSource
    * @return {Promise<LH.Crdp.Page.AddScriptToEvaluateOnLoadResponse>} Identifier of the added script.
    */
-  evaluteScriptOnNewDocument(scriptSource) {
+  evaluateScriptOnNewDocument(scriptSource) {
     return this.sendCommand('Page.addScriptToEvaluateOnLoad', {
       scriptSource,
     });
@@ -278,6 +230,7 @@ class Driver {
         //    so that they can be serialized properly b/c JSON.stringify(new Error('foo')) === '{}'
         expression: `(function wrapInNativePromise() {
           const __nativePromise = window.__nativePromise || Promise;
+          const URL = window.__nativeURL || window.URL;
           return new __nativePromise(function (resolve) {
             return __nativePromise.resolve()
               .then(_ => ${expression})
@@ -311,7 +264,7 @@ class Driver {
   }
 
   /**
-   * @return {Promise<LH.Crdp.Page.GetAppManifestResponse>}
+   * @return {Promise<{url: string, data: string}|null>}
    */
   getAppManifest() {
     return this.sendCommand('Page.getAppManifest')
@@ -324,7 +277,7 @@ class Driver {
           return null;
         }
 
-        return response;
+        return /** @type {Required<LH.Crdp.Page.GetAppManifestResponse>} */ (response);
       });
   }
 
@@ -431,7 +384,7 @@ class Driver {
     };
 
     // Check here for _networkStatusMonitor to satisfy type checker. Any further race condition
-    // will be caught at runtime on calls to it. 
+    // will be caught at runtime on calls to it.
     if (!this._networkStatusMonitor) {
       throw new Error('Driver._waitForNetworkIdle called with no networkStatusMonitor');
     }
@@ -495,7 +448,7 @@ class Driver {
     const checkForQuietExpression = `(${pageFunctions.checkTimeSinceLastLongTask.toString()})()`;
     /**
      * @param {Driver} driver
-     * @param {(value: void) => void} resolve
+     * @param {() => void} resolve
      */
     function checkForQuiet(driver, resolve) {
       if (cancelled) return;
@@ -643,12 +596,12 @@ class Driver {
    * @private
    */
   _beginNetworkStatusMonitoring(startingUrl) {
-    this._networkStatusMonitor = new NetworkRecorder([]);
+    this._networkStatusMonitor = new NetworkRecorder();
 
     // Update startingUrl if it's ever redirected.
     this._monitoredUrl = startingUrl;
-    // TODO(bckenny): WebInspector.NetworkRequest
-    this._networkStatusMonitor.on('requestloaded', redirectRequest => {
+    /** @param {LH.Artifacts.NetworkRequest} redirectRequest */
+    const requestLoadedListener = redirectRequest => {
       // Ignore if this is not a redirected request.
       if (!redirectRequest.redirectSource) {
         return;
@@ -657,7 +610,8 @@ class Driver {
       if (earlierRequest.url === this._monitoredUrl) {
         this._monitoredUrl = redirectRequest.url;
       }
-    });
+    };
+    this._networkStatusMonitor.on('requestloaded', requestLoadedListener);
 
     return this.sendCommand('Network.enable');
   }
@@ -691,11 +645,9 @@ class Driver {
       return this._isolatedExecutionContextId;
     }
 
-    /** @type {LH.Crdp.Page.GetResourceTreeResponse} */
     const resourceTreeResponse = await this.sendCommand('Page.getResourceTree');
     const mainFrameId = resourceTreeResponse.frameTree.frame.id;
 
-    /** @type {LH.Crdp.Page.CreateIsolatedWorldResponse} */
     const isolatedWorldResponse = await this.sendCommand('Page.createIsolatedWorld', {
       frameId: mainFrameId,
       worldName: 'lighthouse_isolated_context',
@@ -717,12 +669,13 @@ class Driver {
    * possible workaround.
    * Resolves on the url of the loaded page, taking into account any redirects.
    * @param {string} url
-   * @param {{waitForLoad?: boolean, disableJavaScript?: boolean, config?: LH.ConfigPass, flags?: LH.Flags}} options
+   * @param {{waitForLoad?: boolean, passContext?: LH.Gatherer.PassContext}} options
    * @return {Promise<string>}
    */
   async gotoURL(url, options = {}) {
     const waitForLoad = options.waitForLoad || false;
-    const disableJS = options.disableJavaScript || false;
+    const passContext = /** @type {Partial<LH.Gatherer.PassContext>} */ (options.passContext || {});
+    const disableJS = passContext.disableJavaScript || false;
 
     await this._beginNetworkStatusMonitoring(url);
     await this._clearIsolatedContextId();
@@ -735,16 +688,15 @@ class Driver {
     this.sendCommand('Page.navigate', {url});
 
     if (waitForLoad) {
-      let pauseAfterLoadMs = options.config && options.config.pauseAfterLoadMs;
-      let networkQuietThresholdMs = options.config && options.config.networkQuietThresholdMs;
-      let cpuQuietThresholdMs = options.config && options.config.cpuQuietThresholdMs;
-      let maxWaitMs = options.flags && options.flags.maxWaitForLoad;
+      const passConfig = /** @type {Partial<LH.Config.Pass>} */ (passContext.passConfig || {});
+      let {pauseAfterLoadMs, networkQuietThresholdMs, cpuQuietThresholdMs} = passConfig;
+      let maxWaitMs = passContext.settings && passContext.settings.maxWaitForLoad;
 
       /* eslint-disable max-len */
       if (typeof pauseAfterLoadMs !== 'number') pauseAfterLoadMs = DEFAULT_PAUSE_AFTER_LOAD;
       if (typeof networkQuietThresholdMs !== 'number') networkQuietThresholdMs = DEFAULT_NETWORK_QUIET_THRESHOLD;
       if (typeof cpuQuietThresholdMs !== 'number') cpuQuietThresholdMs = DEFAULT_CPU_QUIET_THRESHOLD;
-      if (typeof maxWaitMs !== 'number') maxWaitMs = Driver.MAX_WAIT_FOR_FULLY_LOADED;
+      if (typeof maxWaitMs !== 'number') maxWaitMs = constants.defaultSettings.maxWaitForLoad;
       /* eslint-enable max-len */
 
       await this._waitForFullyLoaded(pauseAfterLoadMs, networkQuietThresholdMs, cpuQuietThresholdMs,
@@ -760,7 +712,6 @@ class Driver {
    * @return {Promise<string|null>} The property value, or null, if property not found
   */
   async getObjectProperty(objectId, propName) {
-    /** @type {LH.Crdp.Runtime.GetPropertiesResponse} */
     const propertiesResponse = await this.sendCommand('Runtime.getProperties', {
       objectId,
       accessorPropertiesOnly: true,
@@ -779,23 +730,25 @@ class Driver {
   }
 
   /**
-   * Return the body of the response with the given ID.
+   * Return the body of the response with the given ID. Rejects if getting the
+   * body times out.
    * @param {string} requestId
    * @param {number} [timeout]
    * @return {Promise<string>}
    */
   getRequestContent(requestId, timeout = 1000) {
+    requestId = NetworkRequest.getRequestIdForBackend(requestId);
+
     return new Promise((resolve, reject) => {
       // If this takes more than 1s, reject the Promise.
       // Why? Encoding issues can lead to hanging getResponseBody calls: https://github.com/GoogleChrome/lighthouse/pull/4718
-      // @ts-ignore TODO(bckenny): fix LHError constructor/errors mismatch
       const err = new LHError(LHError.errors.REQUEST_CONTENT_TIMEOUT);
       const asyncTimeout = setTimeout((_ => reject(err)), timeout);
 
       this.sendCommand('Network.getResponseBody', {requestId}).then(result => {
         clearTimeout(asyncTimeout);
         // Ignoring result.base64Encoded, which indicates if body is already encoded
-        resolve(/** @type {LH.Crdp.Network.GetResponseBodyResponse} */(result).body);
+        resolve(result.body);
       }).catch(e => {
         clearTimeout(asyncTimeout);
         reject(e);
@@ -823,11 +776,9 @@ class Driver {
    * @return {Promise<Element|null>} The found element, or null, resolved in a promise
    */
   async querySelector(selector) {
-    /** @type {LH.Crdp.DOM.GetDocumentResponse} */
     const documentResponse = await this.sendCommand('DOM.getDocument');
     const rootNodeId = documentResponse.root.nodeId;
 
-    /** @type {LH.Crdp.DOM.QuerySelectorResponse} */
     const targetNode = await this.sendCommand('DOM.querySelector', {
       nodeId: rootNodeId,
       selector,
@@ -844,11 +795,9 @@ class Driver {
    * @return {Promise<Array<Element>>} The found elements, or [], resolved in a promise
    */
   async querySelectorAll(selector) {
-    /** @type {LH.Crdp.DOM.GetDocumentResponse} */
     const documentResponse = await this.sendCommand('DOM.getDocument');
     const rootNodeId = documentResponse.root.nodeId;
 
-    /** @type {LH.Crdp.DOM.QuerySelectorAllResponse} */
     const targetNodeList = await this.sendCommand('DOM.querySelectorAll', {
       nodeId: rootNodeId,
       selector,
@@ -885,7 +834,6 @@ class Driver {
    * @return {Promise<Array<LH.Crdp.DOM.Node>>} The found nodes, or [], resolved in a promise
    */
   async getNodesInDocument(pierce = true) {
-    /** @type {LH.Crdp.DOM.GetFlattenedDocumentResponse} */
     const flattenedDocument = await this.sendCommand('DOM.getFlattenedDocument',
         {depth: -1, pierce});
 
@@ -893,19 +841,14 @@ class Driver {
   }
 
   /**
-   * @param {{additionalTraceCategories: string=}=} flags
+   * @param {{additionalTraceCategories?: string|null}=} settings
    * @return {Promise<void>}
    */
-  beginTrace(flags) {
-    const additionalCategories = (flags && flags.additionalTraceCategories &&
-        flags.additionalTraceCategories.split(',')) || [];
+  beginTrace(settings) {
+    const additionalCategories = (settings && settings.additionalTraceCategories &&
+        settings.additionalTraceCategories.split(',')) || [];
     const traceCategories = this._traceCategories.concat(additionalCategories);
     const uniqueCategories = Array.from(new Set(traceCategories));
-    const tracingOpts = {
-      categories: uniqueCategories.join(','),
-      transferMode: 'ReturnAsStream',
-      options: 'sampling-frequency=10000', // 1000 is default and too slow.
-    };
 
     // Check any domains that could interfere with or add overhead to the trace.
     if (this.isDomainEnabled('Debugger')) {
@@ -923,7 +866,11 @@ class Driver {
       // ensure tracing is stopped before we can start
       // see https://github.com/GoogleChrome/lighthouse/issues/1091
       .then(_ => this.endTraceIfStarted())
-      .then(_ => this.sendCommand('Tracing.start', tracingOpts));
+      .then(_ => this.sendCommand('Tracing.start', {
+        categories: uniqueCategories.join(','),
+        transferMode: 'ReturnAsStream',
+        options: 'sampling-frequency=10000', // 1000 is default and too slow.
+      }));
   }
 
   /**
@@ -941,13 +888,13 @@ class Driver {
   }
 
   /**
-   * @return {Promise<void>}
+   * @return {Promise<LH.Trace>}
    */
   endTrace() {
     return new Promise((resolve, reject) => {
       // When the tracing has ended this will fire with a stream handle.
-      this.once('Tracing.tracingComplete', streamHandle => {
-        this._readTraceFromStream(streamHandle)
+      this.once('Tracing.tracingComplete', completeEvent => {
+        this._readTraceFromStream(completeEvent)
             .then(traceContents => resolve(traceContents), reject);
       });
 
@@ -957,15 +904,20 @@ class Driver {
   }
 
   /**
-   * @param {LH.Crdp.Tracing.TracingCompleteEvent} streamHandle
+   * @param {LH.Crdp.Tracing.TracingCompleteEvent} traceCompleteEvent
+   * @return {Promise<LH.Trace>}
    */
-  _readTraceFromStream(streamHandle) {
+  _readTraceFromStream(traceCompleteEvent) {
     return new Promise((resolve, reject) => {
       let isEOF = false;
       const parser = new TraceParser();
 
+      if (!traceCompleteEvent.stream) {
+        return reject('No streamHandle returned by traceCompleteEvent');
+      }
+
       const readArguments = {
-        handle: streamHandle.stream,
+        handle: traceCompleteEvent.stream,
       };
 
       /**
@@ -1001,7 +953,7 @@ class Driver {
 
   /**
    * Stop recording to devtoolsLog and return log contents.
-   * @return {Array<{method: string, params: (Object<string, *>|undefined)}>}
+   * @return {LH.DevtoolsLog}
    */
   endDevtoolsLog() {
     this._devtoolsLog.endRecording();
@@ -1016,31 +968,33 @@ class Driver {
   }
 
   /**
-   * @param {LH.Flags} flags
+   * @param {LH.Config.Settings} settings
    * @return {Promise<void>}
    */
-  async beginEmulation(flags) {
-    if (!flags.disableDeviceEmulation) {
+  async beginEmulation(settings) {
+    if (!settings.disableDeviceEmulation) {
       await emulation.enableNexus5X(this);
     }
 
-    await this.setThrottling(flags, {useThrottling: true});
+    await this.setThrottling(settings, {useThrottling: true});
   }
 
   /**
-   * @param {LH.Flags} flags
+   * @param {LH.Config.Settings} settings
    * @param {{useThrottling?: boolean}} passConfig
    * @return {Promise<void>}
    */
-  async setThrottling(flags, passConfig) {
-    const throttleCpu = passConfig.useThrottling && !flags.disableCpuThrottling;
-    const throttleNetwork = passConfig.useThrottling && !flags.disableNetworkThrottling;
-    const cpuPromise = throttleCpu ?
-        emulation.enableCPUThrottling(this) :
+  async setThrottling(settings, passConfig) {
+    if (settings.throttlingMethod !== 'devtools') {
+      return emulation.clearAllNetworkEmulation(this);
+    }
+
+    const cpuPromise = passConfig.useThrottling ?
+        emulation.enableCPUThrottling(this, settings.throttling) :
         emulation.disableCPUThrottling(this);
-    const networkPromise = throttleNetwork ?
-        emulation.enableNetworkThrottling(this) :
-        emulation.disableNetworkThrottling(this);
+    const networkPromise = passConfig.useThrottling ?
+        emulation.enableNetworkThrottling(this, settings.throttling) :
+        emulation.clearAllNetworkEmulation(this);
 
     await Promise.all([cpuPromise, networkPromise]);
   }
@@ -1056,13 +1010,12 @@ class Driver {
   }
 
   /**
-   * Enable internet connection, using emulated mobile settings if
-   * `options.flags.disableNetworkThrottling` is false.
-   * @param {{flags: LH.Flags, config: LH.ConfigPass}} options
+   * Enable internet connection, using emulated mobile settings if applicable.
+   * @param {{settings: LH.Config.Settings, passConfig: LH.Config.Pass}} options
    * @return {Promise<void>}
    */
   async goOnline(options) {
-    await this.setThrottling(options.flags, options.config);
+    await this.setThrottling(options.settings, options.passConfig);
     this.online = true;
   }
 
@@ -1079,17 +1032,15 @@ class Driver {
   }
 
   /**
-   * @param {LH.Crdp.Network.Headers} headers key/value pairs of HTTP Headers.
+   * @param {LH.Crdp.Network.Headers|null} headers key/value pairs of HTTP Headers.
    * @return {Promise<void>}
    */
-  setExtraHTTPHeaders(headers) {
-    if (headers) {
-      return this.sendCommand('Network.setExtraHTTPHeaders', {
-        headers,
-      });
+  async setExtraHTTPHeaders(headers) {
+    if (!headers) {
+      return;
     }
 
-    return Promise.resolve();
+    return this.sendCommand('Network.setExtraHTTPHeaders', {headers});
   }
 
   /**
@@ -1125,8 +1076,9 @@ class Driver {
    * @return {Promise<void>}
    */
   async cacheNatives() {
-    await this.evaluteScriptOnNewDocument(`window.__nativePromise = Promise;
-        window.__nativeError = Error;`);
+    await this.evaluateScriptOnNewDocument(`window.__nativePromise = Promise;
+        window.__nativeError = Error;
+        window.__nativeURL = URL;`);
   }
 
   /**
@@ -1135,39 +1087,7 @@ class Driver {
    */
   async registerPerformanceObserver() {
     const scriptStr = `(${pageFunctions.registerPerformanceObserverInPage.toString()})()`;
-    await this.evaluteScriptOnNewDocument(scriptStr);
-  }
-
-  /**
-   * Keeps track of calls to a JS function and returns a list of {url, line, col}
-   * of the usage. Should be called before page load (in beforePass).
-   * @param {string} funcName The function name to track ('Date.now', 'console.time').
-   * @return {function(): Promise<Array<{url: string, line: number, col: number}>>}
-   *     Call this method when you want results.
-   */
-  captureFunctionCallSites(funcName) {
-    const globalVarToPopulate = `window['__${funcName}StackTraces']`;
-    const collectUsage = () => {
-      return this.evaluateAsync(
-          `Array.from(${globalVarToPopulate}).map(item => JSON.parse(item))`)
-        .then(result => {
-          if (!Array.isArray(result)) {
-            throw new Error(
-                'Driver failure: Expected evaluateAsync results to be an array ' +
-                `but got "${JSON.stringify(result)}" instead.`);
-          }
-          // Filter out usage from extension content scripts.
-          return result.filter(item => !item.isExtension);
-        });
-    };
-
-    const funcBody = pageFunctions.captureJSCallUsage.toString();
-
-    this.evaluteScriptOnNewDocument(`
-        ${globalVarToPopulate} = new Set();
-        (${funcName} = ${funcBody}(${funcName}, ${globalVarToPopulate}))`);
-
-    return collectUsage;
+    await this.evaluateScriptOnNewDocument(scriptStr);
   }
 
   /**
@@ -1203,5 +1123,82 @@ class Driver {
     });
   }
 }
+
+// Declared outside class body because function expressions can be typed via more expressive @type
+/**
+ * Bind listeners for protocol events.
+ * @type {CrdpEventEmitter['on']}
+ */
+Driver.prototype.on = function on(eventName, cb) {
+  if (this._eventEmitter === null) {
+    throw new Error('connect() must be called before attempting to listen to events.');
+  }
+
+  // log event listeners being bound
+  log.formatProtocol('listen for event =>', {method: eventName}, 'verbose');
+  this._eventEmitter.on(eventName, cb);
+};
+
+/**
+ * Bind a one-time listener for protocol events. Listener is removed once it
+ * has been called.
+ * @type {CrdpEventEmitter['once']}
+ */
+Driver.prototype.once = function once(eventName, cb) {
+  if (this._eventEmitter === null) {
+    throw new Error('connect() must be called before attempting to listen to events.');
+  }
+  // log event listeners being bound
+  log.formatProtocol('listen once for event =>', {method: eventName}, 'verbose');
+  this._eventEmitter.once(eventName, cb);
+};
+
+/**
+ * Unbind event listener.
+ * @type {CrdpEventEmitter['removeListener']}
+ */
+Driver.prototype.off = function off(eventName, cb) {
+  if (this._eventEmitter === null) {
+    throw new Error('connect() must be called before attempting to remove an event listener.');
+  }
+
+  this._eventEmitter.removeListener(eventName, cb);
+};
+
+/** @typedef {LH.CrdpCommands[keyof LH.CrdpCommands]['returnType']} CommandReturnTypes */
+
+/**
+ * Loosely-typed internal implementation of `Driver.sendCommand` which is
+ * strictly typed externally on exposed Driver interface. Type tightening occurs
+ * when assigned to `Driver.prototype` below and typed with
+ * `LH.Protocol.SendCommand`.
+ * Necessitated by `params` only being optional for some values of `method`.
+ * See https://github.com/Microsoft/TypeScript/issues/5453 for needed variadic
+ * primitive.
+ * @this {Driver}
+ * @param {any} method
+ * @param {any=} params,
+ * @param {{silent?: boolean}=} cmdOpts
+ * @return {Promise<CommandReturnTypes>}
+ */
+function _sendCommand(method, params, cmdOpts = {}) {
+  const domainCommand = /^(\w+)\.(enable|disable)$/.exec(method);
+  if (domainCommand) {
+    const enable = domainCommand[2] === 'enable';
+    // eslint-disable-next-line no-invalid-this
+    if (!this._shouldToggleDomain(domainCommand[1], enable)) {
+      return Promise.resolve();
+    }
+  }
+
+  // eslint-disable-next-line no-invalid-this
+  return this._connection.sendCommand(method, params, cmdOpts);
+}
+
+/**
+ * Call protocol methods.
+ * @type {LH.Protocol.SendCommand}
+ */
+Driver.prototype.sendCommand = _sendCommand;
 
 module.exports = Driver;
